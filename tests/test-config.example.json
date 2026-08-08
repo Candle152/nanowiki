@@ -1,0 +1,19 @@
+{
+  "_说明": "NanoWiki 集成测试配置模板。复制为 test-config.local.json 并填入真实 API key。该文件已在 .gitignore 中排除。",
+  "providers": {
+    "openai": {
+      "provider_type": "openai",
+      "api_key": "sk-your-api-key-here",
+      "models": ["gpt-4o", "gpt-4o-mini"],
+      "base_url": "https://api.openai.com/v1"
+    },
+    "anthropic": {
+      "provider_type": "anthropic",
+      "api_key": "sk-ant-your-key-here",
+      "models": ["claude-sonnet-4-20250514"],
+      "base_url": "https://api.anthropic.com"
+    }
+  },
+  "default_provider": "openai",
+  "current_model": "gpt-4o",
+}

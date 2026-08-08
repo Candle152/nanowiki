@@ -1,0 +1,8 @@
+[api]
+base_url = "https://api.example.com/v1"
+timeout_secs = 30
+cache_dir = ".cache"
+
+[retry]
+max_attempts = 3
+backoff_ms = 1000
