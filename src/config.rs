@@ -97,9 +97,9 @@ fn interactive_setup() -> anyhow::Result<Config> {
     std::fs::create_dir_all(&dir)?;
 
     println!();
-    println!("╔══════════════════════════════════════════╗");
-    println!("║       NanoWiki — First-time Setup            ║");
-    println!("╚══════════════════════════════════════════╝");
+    println!("============================================");
+    println!("        NanoWiki - First-time Setup");
+    println!("============================================");
     println!();
     println!("We will configure an LLM provider. Press Ctrl+C to exit.");
     println!();
@@ -139,7 +139,7 @@ fn interactive_setup() -> anyhow::Result<Config> {
         let url = prompt_default(&format!("  Base URL [{}]", default_url), default_url)?;
         let base_url = if url == default_url { None } else { Some(url) };
 
-        let api_key = prompt_sensitive("  API Key")?;
+        let api_key = prompt("  API Key")?;
 
         config.providers.insert(
             name.clone(),
@@ -240,10 +240,6 @@ fn prompt_default(label: &str, default: &str) -> anyhow::Result<String> {
     stdin().read_line(&mut input)?;
     let t = input.trim().to_string();
     Ok(if t.is_empty() { default.to_string() } else { t })
-}
-
-fn prompt_sensitive(label: &str) -> anyhow::Result<String> {
-    prompt(label)
 }
 
 

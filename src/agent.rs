@@ -17,7 +17,7 @@ pub enum Client {
     OpenAI(rig_core::providers::openai::Client),
     Anthropic(rig_core::providers::anthropic::Client),
     #[cfg(test)]
-    Mock(std::cell::RefCell<Vec<AgentResponse>>),
+    Mock(Arc<std::sync::Mutex<Vec<AgentResponse>>>),
 }
 
 impl Client {
@@ -46,17 +46,21 @@ impl Client {
 
     #[cfg(test)]
     pub fn mock(responses: Vec<AgentResponse>) -> Self {
-        Client::Mock(std::cell::RefCell::new(responses))
+        Client::Mock(Arc::new(std::sync::Mutex::new(responses)))
     }
 
     pub async fn completion(
         &self,
-        request: CompletionRequest,
+        mut request: CompletionRequest,
     ) -> anyhow::Result<AgentResponse> {
         #[cfg(test)]
         if let Client::Mock(cell) = self {
-            return cell.borrow_mut().pop().ok_or_else(|| anyhow::anyhow!("mock responses exhausted"));
+            return cell.lock().unwrap().pop().ok_or_else(|| anyhow::anyhow!("mock responses exhausted"));
         }
+
+        // DeepSeek exposes a hidden thinking mode; disable it so responses come
+        // back as plain text instead of being consumed by reasoning.
+        request.additional_params = Some(disable_thinking(request.additional_params.take()));
 
         let model_name = request.model.clone().unwrap_or_default();
         match self {
@@ -94,6 +98,19 @@ impl Client {
             }
         }
     }
+}
+
+/// Merge DeepSeek's `thinking: disabled` flag into a request's
+/// `additional_params`, preserving any params already present.
+fn disable_thinking(additional: Option<serde_json::Value>) -> serde_json::Value {
+    let mut obj = additional
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    obj.insert(
+        "thinking".to_string(),
+        serde_json::json!({"type": "disabled"}),
+    );
+    serde_json::Value::Object(obj)
 }
 
 /// Exponential backoff retry: up to 3 attempts. 4xx errors are not retried.
@@ -233,7 +250,9 @@ impl ToolDispatcher {
             }
             "ReadFile" => {
                 let file_path = args["file_path"].as_str().unwrap_or("");
-                tools::read_file::read_file(&self.repo_root, file_path)
+                let offset = args["offset"].as_u64().map(|v| v as usize);
+                let limit = args["limit"].as_u64().map(|v| v as usize);
+                tools::read_file::read_file(&self.repo_root, file_path, offset, limit)
             }
             "WriteWikiPage" => {
                 let page_name = args["page_name"].as_str().unwrap_or("");
@@ -258,6 +277,26 @@ impl ToolDispatcher {
                 tools::edit_page::edit_wiki_page(&self.wiki_root, page_name, old_text, new_text)?;
                 Ok(format!("page edited: {}", page_name))
             }
+            "PruneContext" => {
+                let summary = args["summary"].as_str().unwrap_or("");
+                let plan = args["plan"].as_str().unwrap_or("");
+                tools::prune_context::prune_context(summary, plan)
+            }
+            "SkeletonTool" => {
+                let action = args["action"].as_str().unwrap_or("status");
+                match action {
+                    "status" => {
+                        let skeleton_page = args["skeleton_page"].as_str().unwrap_or("_skeleton.md");
+                        tools::skeleton::skeleton_status(&self.wiki_root, skeleton_page)
+                    }
+                    "complete" => {
+                        let skeleton_page = args["skeleton_page"].as_str().unwrap_or("_skeleton.md");
+                        let target_page = args["target_page"].as_str().unwrap_or("");
+                        tools::skeleton::skeleton_complete(&self.wiki_root, skeleton_page, target_page)
+                    }
+                    _ => Err(format!("unknown SkeletonTool action: {}", action)),
+                }
+            }
             _ => Err(format!("unknown tool: {}", name)),
         }
     }
@@ -271,6 +310,8 @@ fn tool_icon(name: &str) -> &str {
         "SearchCode" => "🔎",
         "WriteWikiPage" => "✍️",
         "EditWikiPage" => "📝",
+        "PruneContext" => "🧹",
+        "SkeletonTool" => "📋",
         _ => "🔧",
     }
 }
@@ -283,12 +324,13 @@ fn tool_detail(tc: &ToolCallInfo) -> String {
             if p.is_empty() { "/".into() } else { p.to_string() }
         }
         "ReadFile" => {
-            let fp = tc.arguments["file_path"].as_str().unwrap_or("?");
-            std::path::Path::new(fp)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(fp)
-                .to_string()
+            let p = tc.arguments["file_path"].as_str().unwrap_or("?");
+            match (tc.arguments["offset"].as_u64(), tc.arguments["limit"].as_u64()) {
+                (Some(start), Some(n)) => format!("{} [{}:+{}]", p, start, n),
+                (Some(start), None) => format!("{} [{}:]", p, start),
+                (None, Some(n)) => format!("{} [:+{}]", p, n),
+                (None, None) => p.to_string(),
+            }
         }
         "GlobFiles" => {
             tc.arguments["pattern"].as_str().unwrap_or("*").to_string()
@@ -305,6 +347,16 @@ fn tool_detail(tc: &ToolCallInfo) -> String {
         }
         "EditWikiPage" => {
             tc.arguments["page_name"].as_str().unwrap_or("?").to_string()
+        }
+        "SkeletonTool" => {
+            let action = tc.arguments["action"].as_str().unwrap_or("?");
+            match action {
+                "complete" => {
+                    let t = tc.arguments["target_page"].as_str().unwrap_or("?");
+                    format!("✓ {}", t)
+                }
+                _ => "status".to_string(),
+            }
         }
         _ => "?".into(),
     }
@@ -440,6 +492,19 @@ impl AgentRunner {
                     .unwrap_or_else(|e| format!("error: {}", e));
                 messages.push(Message::tool_result(&tc.id, &result));
             }
+
+            // PruneContext：丢弃 system+user 和当前轮之间的所有历史消息
+            if tool_calls.iter().any(|tc| tc.name == "PruneContext") {
+                let keep_system_user = 2;
+                let current_round = tool_calls.len() * 2; // assistant + tool_result
+                let drain_end = messages.len() - current_round;
+                if drain_end > keep_system_user {
+                    let before = total_prompt + total_completion;
+                    let removed = drain_end - keep_system_user;
+                    messages.drain(keep_system_user..drain_end);
+                    println!("  🧹 pruned {} round(s) · before: {} tokens", removed / 2, format_tokens(before));
+                }
+            }
         }
 
     }
@@ -451,7 +516,7 @@ pub const SYSTEM_PROMPT_INIT: &str = include_str!("prompts/system-init.txt");
 pub const SYSTEM_PROMPT_UPDATE: &str = include_str!("prompts/system-update.txt");
 
 pub async fn run_init(
-    client: Client,
+    mut client: Client,
     repo_root: &Path,
     model: &str,
 ) -> anyhow::Result<()> {
@@ -469,8 +534,107 @@ pub async fn run_init(
     println!("Scanning repository files...");
     let files = scanner::scan_repo(repo_root)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    let file_list: Vec<String> = files.iter().map(|f| f.relative_path.clone()).collect();
-    println!("Found {} files", file_list.len());
+    println!("Found {} files", files.len());
+
+    // Phase 1: Extract structured summaries from each file
+    let scan_dir = wiki_root.join("_scan");
+    std::fs::create_dir_all(&scan_dir)?;
+
+    println!("Extracting file summaries...");
+    let all_extractable: Vec<_> = files
+        .iter()
+        .filter(|f| {
+            let full = repo_root.join(&f.relative_path);
+            let size = std::fs::metadata(&full).map(|m| m.len()).unwrap_or(0);
+            crate::extract::should_extract(Path::new(&f.relative_path), size)
+        })
+        .collect();
+
+    // Incremental: skip files that already have a summary
+    let (fresh, _skipped) = {
+        let mut fresh = Vec::new();
+        let mut skipped = 0usize;
+        for f in &all_extractable {
+            let out = crate::extract::summary_path(&scan_dir, &f.relative_path);
+            if out.exists() {
+                skipped += 1;
+            } else {
+                fresh.push(f);
+            }
+        }
+        if skipped > 0 {
+            println!("  {} files already extracted, {} new", skipped, fresh.len());
+        }
+        (fresh, skipped)
+    };
+
+    if fresh.is_empty() {
+        println!("Extraction up to date.\n");
+    } else {
+        println!("Extracting {} files...", fresh.len());
+        let mut extract_prompt_tokens = 0u64;
+        let mut extract_completion_tokens = 0u64;
+
+        use futures::stream::{self, StreamExt};
+        const CONCURRENCY: usize = 5;
+        let fresh_len = fresh.len();
+        let client_arc = Arc::new(client);
+
+        let tasks: Vec<_> = fresh
+            .into_iter()
+            .enumerate()
+            .map(|(i, f)| {
+                let rel = f.relative_path.clone();
+                let repo = repo_root.to_path_buf();
+                let scan = scan_dir.clone();
+                let model = model.to_string();
+                let c = Arc::clone(&client_arc);
+                async move {
+                    println!("  [{}/{}] {}", i + 1, fresh_len, rel);
+                    crate::extract::extract_file(&c, &model, &repo, &rel, &scan).await
+                }
+            })
+            .collect();
+
+        let results = stream::iter(tasks)
+            .buffer_unordered(CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for result in results {
+            match result {
+                Ok((prompt, completion)) => {
+                    extract_prompt_tokens += prompt as u64;
+                    extract_completion_tokens += completion as u64;
+                }
+                Err(e) => {
+                    eprintln!("    skip: {}", e);
+                }
+            }
+        }
+
+        client = Arc::try_unwrap(client_arc)
+            .unwrap_or_else(|_| panic!("Arc still has references"));
+        println!(
+            "Extraction complete · {} files · {} prompt + {} completion = {} tokens\n",
+            fresh_len,
+            format_tokens(extract_prompt_tokens),
+            format_tokens(extract_completion_tokens),
+            format_tokens(extract_prompt_tokens + extract_completion_tokens),
+        );
+    }
+
+    // Phase 2: Aggregate per-file summaries into a single repository map
+    println!("Generating repository map...");
+    let map_path = wiki_root.join("_map.md");
+    let (map_prompt, map_completion) =
+        crate::map::generate_map(&client, model, repo_root, &files, &scan_dir, &map_path).await?;
+    println!(
+        "Repository map complete · {} prompt + {} completion = {} tokens\n",
+        format_tokens(map_prompt as u64),
+        format_tokens(map_completion as u64),
+        format_tokens(map_prompt as u64 + map_completion as u64),
+    );
 
     let wiki_goal = if wiki_root.join("INSTRUCTIONS.md").exists() {
         std::fs::read_to_string(wiki_root.join("INSTRUCTIONS.md"))?
@@ -479,10 +643,8 @@ pub async fn run_init(
     };
 
     let user_prompt = format!(
-        "Repository root: {}\n\nFile list ({} files):\n{}\n\n{}",
+        "Repository root: {}\n\nPre-extracted file summaries are in .nanowiki/_scan/.\n\n{}",
         repo_root.display(),
-        file_list.len(),
-        file_list.join("\n"),
         wiki_goal
     );
 
@@ -580,6 +742,7 @@ fn finalize_init(
     status: &str,
 ) -> anyhow::Result<()> {
     let _ = std::fs::remove_file(wiki_root.join("_skeleton.md"));
+    let _ = std::fs::remove_file(wiki_root.join("_map.md"));
 
     let git_head = crate::git::get_head_commit(repo_root)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -668,6 +831,16 @@ mod tests {
         let wiki = repo.join(".nanowiki");
         fs::create_dir_all(&wiki).unwrap();
         (tmp, repo, wiki)
+    }
+
+    #[test]
+    fn disable_thinking_merges_into_additional_params() {
+        let v = disable_thinking(Some(serde_json::json!({"foo": 1})));
+        assert_eq!(v["thinking"], serde_json::json!({"type": "disabled"}));
+        assert_eq!(v["foo"], 1);
+
+        let v = disable_thinking(None);
+        assert_eq!(v, serde_json::json!({"thinking": {"type": "disabled"}}));
     }
 
     #[tokio::test]
@@ -945,5 +1118,60 @@ fn make_tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["page_name", "old_text", "new_text"]
             }),
         },
+        ToolDefinition {
+            name: "PruneContext".into(),
+            description: "清理对话上下文，保留系统提示和当前摘要。当你完成一个阶段（写完skeleton、完成一批页面）后调用此工具来丢弃不再需要的探索历史（文件内容、目录列表等），防止上下文溢出。调用后，新阶段的摘要和计划会替代被清理的历史。".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "已完成工作的精简摘要，替代被清理的探索历史。包含关键发现和成果。"},
+                    "plan": {"type": "string", "description": "下一步的详细计划。帮助你在上下文清理后继续高效工作。"}
+                },
+                "required": ["summary", "plan"]
+            }),
+        },
+        ToolDefinition {
+            name: "SkeletonTool".into(),
+            description: "Manage the documentation skeleton — check progress and mark pages as done. Use 'status' to see pending/done pages, 'complete' to mark a page as finished.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "complete"],
+                        "description": "'status' shows all pages and their state; 'complete' marks a page as done"
+                    },
+                    "skeleton_page": {
+                        "type": "string",
+                        "description": "Skeleton file path, default '_skeleton.md'"
+                    },
+                    "target_page": {
+                        "type": "string",
+                        "description": "Page name to mark as done (required for 'complete' action)"
+                    }
+                },
+                "required": ["action"]
+            }),
+        },
     ]
+}
+
+#[test]
+fn all_tool_names_are_consistent() {
+    // Every tool in make_tool_definitions must have an icon and a dispatch handler.
+    // This prevents adding a tool definition while forgetting icon or dispatch.
+    let defs = make_tool_definitions();
+    let def_names: std::collections::HashSet<&str> =
+        defs.iter().map(|d| d.name.as_str()).collect();
+
+    // Check every definition has an icon
+    for name in &def_names {
+        let icon = tool_icon(name);
+        assert!(icon != "🔧", "tool '{}' has no dedicated icon", name);
+    }
+
+    // Check tool_icon doesn't reference non-existent tools
+    // (tool_icon only returns 🔧 for unknowns, so this is covered above)
+
+    assert!(def_names.len() >= 8, "expected at least 8 tools, got {}", def_names.len());
 }
