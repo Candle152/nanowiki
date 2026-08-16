@@ -61,10 +61,40 @@ NanoWiki stores its config at `~/.nanowiki/config.json`. The first run (`init`) 
 
 Supports any OpenAI-compatible API (DeepSeek, Ollama, Groq, etc.) and Anthropic's native API.
 
+## Why NanoWiki?
+
+Inspired by [OpenWiki](https://github.com/langchain-ai/openwiki) by the LangChain team, NanoWiki strips away the parts it doesn't need and runs as a pure Rust CLI — no Node.js or Bun runtime required. It is built for coding agents: generate a wiki so an agent can grasp a project quickly.
+
+### When to use it
+
+- **Small utility projects**: usually unnecessary — an agent can read the files directly and make changes.
+- **Medium-to-large projects**: structured docs offer a slight edge — when you change a module's interface you are less likely to miss its callers; getting it right in one pass costs fewer tokens than discovering the problem later.
+
+### A bet on compression
+
+Models have a limited context window — you cannot read every document before writing, and overflowing context means lost information and ballooning token costs. Rather than "compress when the window is nearly full", NanoWiki tries to write the wiki with fewer tokens while keeping quality. This is one of the project's core explorations, and it has not been fully verified yet.
+
+### Current scope
+
+- Only DeepSeek's thinking mode is handled today. With other models, the map step may return nothing because the output is consumed entirely by thinking tokens.
+- Personal wikis are out of scope for now. A question worth asking: would you actually read AI-written docs instead of just asking the agent?
+
+### Cost
+
+Generating a wiki for the OpenWiki project (deepseek-v4-flash): ~18.27M tokens, about $0.27 (¥1.84), with acceptable quality.
+
 ## How It Works
 
-1. **`nanowiki init`** — scans the repo, feeds the file tree to an LLM, and the LLM explores the codebase using 6 tools (list directory, glob, search, read file, write page, edit page). It produces structured Markdown docs under `.nanowiki/`.
-2. **`nanowiki update`** — computes `git diff` since the last run and tells the LLM to edit only the affected pages.
+`nanowiki init` runs a four-phase pipeline:
+
+1. **Scan** — walk the repository (respecting `.gitignore`) to list all files.
+2. **Extract** — summarize each source file with the LLM into `.nanowiki/_scan/`.
+3. **Map** — aggregate the summaries plus a static file tree into one compressed `.nanowiki/_map.md`.
+4. **Write** — the agent reads `_map.md`, drafts a page skeleton, then reads the actual source files to fill in each page, and finally writes `quickstart.md`.
+
+The agent uses 8 tools (list directory, glob, search, read file, write page, edit page, skeleton, prune context).
+
+`nanowiki update` computes `git diff` since the last run and edits only the affected pages.
 
 The generated `AGENTS.md` at the repo root enables any AI coding agent to navigate the docs automatically.
 
@@ -73,18 +103,15 @@ The generated `AGENTS.md` at the repo root enables any AI coding agent to naviga
 ```
 .nanowiki/
 ├── INDEX.md              # Auto-generated page index
-├── .last-update.json      # Run metadata
 ├── quickstart.md          # Entry point for AI agents
-├── architecture/          # Architecture docs
-├── cli/                   # CLI / command docs
-├── agent/                 # Core engine docs
-├── operations/            # Build & deploy docs
-└── integrations/          # External dependency docs
+├── .last-update.json      # Run metadata (git HEAD, model, status)
+├── _scan/                 # Per-file summaries (extract phase)
+└── <topic>.md             # Structured docs (overview, cli, config, ...)
 ```
 
 ## Acknowledgments
 
-NanoWiki is inspired by [OpenWiki](https://github.com/anthropics/openwiki) by Anthropic. The prompt engineering and output structure draw from OpenWiki's design.
+NanoWiki is inspired by [OpenWiki](https://github.com/langchain-ai/openwiki) by the LangChain team. The prompt engineering and output structure draw from OpenWiki's design.
 
 ## License
 
